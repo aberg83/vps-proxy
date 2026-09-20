@@ -373,6 +373,23 @@ map \$geoip2_country_code \$allowed_country {
     default no;
 ${ALLOWED_COUNTRY_MAP_LINES}}
 
+# Local HTTPS health probes originate from loopback and therefore have no
+# GeoIP country. Permit only literal loopback sources to bypass the country
+# gate so the probe reaches the configured backend instead of merely testing
+# nginx's 403 response.
+map \$remote_addr \$loopback_request {
+    default   no;
+    127.0.0.1 yes;
+    ::1       yes;
+}
+
+map "\$allowed_country:\$loopback_request" \$request_allowed {
+    default   no;
+    "no:yes"  yes;
+    "yes:no"  yes;
+    "yes:yes" yes;
+}
+
 # A dedicated log, separate from nginx's own default access log, with the
 # resolved country on every line. A 403 here is unambiguously a geoblock
 # denial (nothing else in this config returns 403), and the country is
@@ -557,7 +574,7 @@ server {
     # specifically to slow automated credential guessing against short PINs.
     # This is friction, not a substitute for Jellyfin's own account lockout.
     location = /Users/AuthenticateByName {
-        if (\$allowed_country = no) {
+        if (\$request_allowed = no) {
             return 403;
         }
         limit_req zone=jellyfin_auth_limit burst=5 nodelay;
@@ -568,7 +585,7 @@ server {
     }
 
     location / {
-        if (\$allowed_country = no) {
+        if (\$request_allowed = no) {
             return 403;
         }
         limit_req zone=general_limit burst=100 nodelay;
