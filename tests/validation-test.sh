@@ -39,4 +39,19 @@ if validate_host_label '-vps-proxy' || validate_host_label 'VPS-PROXY' ||
     exit 1
 fi
 
+
+setup_script="${REPO_ROOT}/setup-vps-proxy.sh"
+# shellcheck disable=SC2016
+grep -Fq 'map "\$allowed_country:\$loopback_request" \$request_allowed {' "$setup_script"
+# shellcheck disable=SC2016
+if [[ $(grep -Fc 'if (\$request_allowed = no)' "$setup_script") -ne 2 ]]; then
+    echo "expected both proxied locations to use the combined access gate" >&2
+    exit 1
+fi
+# shellcheck disable=SC2016
+if grep -Fq 'if (\$allowed_country = no)' "$setup_script"; then
+    echo "legacy country-only access gate is still present" >&2
+    exit 1
+fi
+
 echo "validation tests passed"
