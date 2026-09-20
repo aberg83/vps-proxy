@@ -168,59 +168,6 @@ run_step "Upgrading installed packages" apt-get upgrade -y
 run_step "Installing base packages" apt-get install -y curl gnupg2 ca-certificates lsb-release apt-transport-https git
 
 ### ---------------------------------------------------------------------------
-### 0a-pre. Git deploy key — needed once ufw closes public SSH
-### ---------------------------------------------------------------------------
-# Tailscale SSH's own server implementation has incomplete support for agent
-# forwarding (it relies on forwarding a Unix socket, a known long-standing gap
-# vs. regular OpenSSH). Once ufw closes public SSH later in this script,
-# Tailscale SSH becomes the only way in, and `-A` agent forwarding to reach
-# GitHub from this VPS stops being reliable from that point on — not a one-off
-# glitch, a structural consequence of locking SSH down. A standing deploy key
-# on the VPS itself sidesteps the problem entirely, for both git directions.
-#
-# The keypair + SSH config below is fully automatable. Registering the public
-# key with GitHub is NOT — that's a one-time manual paste into the repo's
-# Settings > Deploy keys page. There's no credential-free way to script that
-# side without storing a GitHub API token on the VPS just to automate one
-# paste, which trades a small manual step for a standing credential that's
-# arguably worse. So this prints exactly what to paste and where.
-DEPLOY_KEY_PATH="/root/.ssh/id_ed25519_deploy"
-if [[ -f "$DEPLOY_KEY_PATH" ]]; then
-    echo "==> Git deploy key already exists at ${DEPLOY_KEY_PATH}"
-else
-    echo "==> Generating a git deploy key for this VPS"
-    mkdir -p /root/.ssh
-    ssh-keygen -t ed25519 -C "vps-proxy-deploy-$(hostname)" -f "$DEPLOY_KEY_PATH" -N ""
-fi
-
-if ! grep -q "IdentityFile ${DEPLOY_KEY_PATH}" /root/.ssh/config 2>/dev/null; then
-    cat >> /root/.ssh/config <<EOF
-Host github.com
-    IdentityFile ${DEPLOY_KEY_PATH}
-    IdentitiesOnly yes
-EOF
-fi
-chmod 600 /root/.ssh/config
-
-SSH_TEST_OUTPUT=$(ssh -T git@github.com -o BatchMode=yes -o StrictHostKeyChecking=accept-new 2>&1 || true)
-if echo "$SSH_TEST_OUTPUT" | grep -qi "successfully authenticated"; then
-    echo "==> Deploy key already registered and working with GitHub"
-else
-    echo ""
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo " ACTION NEEDED: register this VPS's deploy key with GitHub"
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-    echo " Add this public key at: your repo -> Settings -> Deploy keys -> Add deploy key"
-    echo " Leave 'Allow write access' UNCHECKED — this VPS only ever needs to pull."
-    echo ""
-    cat "${DEPLOY_KEY_PATH}.pub"
-    echo ""
-    echo " Once added, this VPS can git pull without needing your own key"
-    echo " forwarded through a session — which Tailscale SSH can't reliably do anyway."
-    echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
-fi
-
-### ---------------------------------------------------------------------------
 ### 0a. Unattended security upgrades
 ### ---------------------------------------------------------------------------
 run_step "Installing unattended-upgrades (auto-applies security patches)" apt-get install -y unattended-upgrades apt-listchanges

@@ -8,6 +8,14 @@ if git grep -nEI "$patterns" -- . ':(exclude)scripts/public-safety-check.sh'; th
     exit 1
 fi
 
+# A public HTTPS workflow must not recreate the old private-repository
+# deploy-key machinery.
+if git grep -nEI '(id_ed25519_deploy|Settings.*Deploy keys|git@github\.com)' -- \
+    setup-vps-proxy.sh README.md; then
+    echo "private GitHub deploy-key workflow found in the public tree" >&2
+    exit 1
+fi
+
 # Keep deployment-specific inventory out of the reusable public tree.
 if git grep -nF 'boxer.sh' -- . ':(exclude)scripts/public-safety-check.sh'; then
     echo "deployment-specific hostname found in the tracked tree" >&2
