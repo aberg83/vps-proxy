@@ -1,0 +1,3 @@
+# Keep the real inventory at /etc/vps-proxy/sites.list.
+media.example.com:8096:streaming
+requests.example.com:5055

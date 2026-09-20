@@ -1,0 +1,28 @@
+# Copy to vps-proxy.conf, fill in real values, and keep it private.
+# This is sourced as root, so it must contain trusted shell assignments only.
+
+VPS_HOSTNAME=""                    # blank keeps the current hostname
+VPS_TIMEZONE=""                    # e.g. "America/Toronto"
+NEW_SUDO_USERNAME=""               # blank skips limited-user creation
+LOCK_ROOT_PASSWORD=false           # true requires NEW_SUDO_USERNAME
+
+BACKEND_TAILNET_HOST="backend.your-tailnet.ts.net"
+
+# Required on the first run. After GeoLite2-Country.mmdb exists, these may be
+# blanked to avoid retaining the MaxMind credential on the VPS.
+MAXMIND_ACCOUNT_ID=""
+MAXMIND_LICENSE_KEY=""
+
+TAILSCALE_AUTHKEY=""               # optional one-time enrollment key
+ALLOWED_COUNTRY="CA"               # space-separated ISO alpha-2 codes
+CERTBOT_EMAIL="you@example.com"
+
+# The real registry is deliberately outside Git so this repository can be public.
+SITES_REGISTRY_FILE="/etc/vps-proxy/sites.list"
+
+HEALTHCHECKS_PING_URL=""           # e.g. https://hc-ping.com/xxxxxxxx
+HEALTHCHECK_DOMAIN=""              # blank uses the first site in the registry
+HEALTHCHECK_PATH="/"               # lightweight path that reaches the backend
+HEALTHCHECK_EXPECTED_STATUS="200,301,302"
+
+SWAP_SIZE_MB=2048

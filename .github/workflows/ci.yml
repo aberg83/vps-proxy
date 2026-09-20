@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Check Bash syntax
+        run: |
+          bash -n setup-vps-proxy.sh
+          bash -n lib/validation.sh
+          bash -n tests/validation-test.sh
+          bash -n scripts/public-safety-check.sh
+      - name: Run ShellCheck
+        run: shellcheck setup-vps-proxy.sh lib/validation.sh tests/validation-test.sh scripts/public-safety-check.sh
+      - name: Run validation tests
+        run: tests/validation-test.sh
+      - name: Check public tree for likely secrets
+        run: scripts/public-safety-check.sh
