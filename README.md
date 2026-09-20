@@ -149,14 +149,3 @@ sudo journalctl -u weekly-full-upgrade --since "-8 days"
 Automatic security upgrades are enabled. A weekly full upgrade also covers
 third-party Tailscale and CrowdSec repositories. Automatic reboot remains
 disabled; check `/var/run/reboot-required` and reboot at a convenient time.
-
-## Making the repository public
-
-The current tracked tree contains examples only, and CI rejects common token,
-private-key, Healthchecks UUID, and deployment-hostname patterns. That does
-not sanitize existing Git history.
-
-Before changing visibility, read [PUBLIC_RELEASE.md](PUBLIC_RELEASE.md). If
-past commits contain deployment details or identifying commit metadata you do
-not want public, publish the sanitized current tree as a fresh repository or
-rewrite the history first.
