@@ -36,7 +36,7 @@ them on the VPS; do not commit deployment inventory or credentials.
 2. Clone the repository:
 
    ```bash
-   git clone git@github.com:youruser/vps-proxy.git /opt/vps-proxy
+   git clone https://github.com/youruser/vps-proxy.git /opt/vps-proxy
    cd /opt/vps-proxy
    ```
 
@@ -70,9 +70,6 @@ them on the VPS; do not commit deployment inventory or credentials.
 8. Limit `tag:vps` in the Tailscale policy to only the listed backend ports.
 9. Point each public DNS name at the VPS and rerun if certificate issuance
    initially failed.
-
-The first run prints a read-only deploy key for GitHub. Add it under
-**Settings → Deploy keys** without write access.
 
 ## Site registry
 
