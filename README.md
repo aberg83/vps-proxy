@@ -29,26 +29,6 @@ scripts/public-safety-check.sh
 The real `vps-proxy.conf` and `sites.list` are intentionally ignored. Keep
 them on the VPS; do not commit deployment inventory or credentials.
 
-## Important migration for installations created before this change
-
-Do this **before merging/pulling the change that removes the tracked
-`sites.list`**:
-
-```bash
-sudo install -d -m 700 -o root -g root /etc/vps-proxy
-sudo install -m 600 -o root -g root /opt/vps-proxy/sites.list /etc/vps-proxy/sites.list
-sudo grep -vE '^[[:space:]]*(#|$)' /etc/vps-proxy/sites.list
-```
-
-Then ensure `vps-proxy.conf` contains:
-
-```bash
-SITES_REGISTRY_FILE="/etc/vps-proxy/sites.list"
-```
-
-Only after confirming the copied entries should you merge, pull, and rerun the
-script.
-
 ## Fresh installation
 
 1. Provision Ubuntu 22.04 or 24.04 and initially connect through the provider
