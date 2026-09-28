@@ -35,12 +35,16 @@ them on the VPS; do not commit deployment inventory or credentials.
 
 1. Provision Ubuntu 22.04 or 24.04 and initially connect through the provider
    console or temporary public SSH.
-2. Clone the repository:
+2. Clone the repository as root. Everything in the checkout runs as root, so
+   the script refuses to start unless the checkout and its parent
+   directories are root-owned and not writable by group or others:
 
    ```bash
-   git clone https://github.com/youruser/vps-proxy.git /opt/vps-proxy
+   sudo git clone https://github.com/youruser/vps-proxy.git /opt/vps-proxy
    cd /opt/vps-proxy
    ```
+
+   Update it later with `sudo git -C /opt/vps-proxy pull`.
 
 3. Create the private files:
 
@@ -106,13 +110,23 @@ Unrelated nginx files are never pruned.
 
 ## Firewall behavior
 
-Every run reconciles the required UFW defaults and rules. If an unrestricted
-public port-22/OpenSSH rule is found, the script aborts and asks you to review
-and remove it manually. It never guesses which administrator-created rule is
-safe to delete.
+Every run reconciles the required UFW defaults and rules. If any rule opens
+SSH to every source address (`22`, `22/tcp`, `ssh`, `OpenSSH`, a port list or
+range containing 22, or the same on a non-Tailscale interface), the script
+lists those rules and aborts so you can remove them manually. Rules limited to
+`tailscale0` or to specific source addresses are left alone. It never guesses
+which administrator-created rule is safe to delete.
 
 Root's password can be locked only when `NEW_SUDO_USERNAME` names an existing
 sudo user and you interactively confirm working Tailscale SSH and sudo access.
+
+## HTTPS
+
+Every proxied site serves HTTP/2 and sends
+`Strict-Transport-Security: max-age=31536000` (without `includeSubDomains`
+or `preload`). Set `HSTS_MAX_AGE` in `vps-proxy.conf` to change the lifetime,
+or `0` to disable it. Browsers remember the header for that long, so disable
+it well before a proxied domain ever needs plain HTTP again.
 
 ## Health monitoring
 
@@ -146,5 +160,7 @@ sudo journalctl -u weekly-full-upgrade --since "-8 days"
 ```
 
 Automatic security upgrades are enabled. A weekly full upgrade also covers
-third-party Tailscale and CrowdSec repositories. Automatic reboot remains
+third-party Tailscale and CrowdSec repositories and refreshes CrowdSec's hub
+content. Set `UPGRADE_HEALTHCHECKS_PING_URL` to a separate healthchecks.io
+check (7-day period, about 1 day of grace) to be alerted when it fails. Automatic reboot remains
 disabled; check `/var/run/reboot-required` and reboot at a convenient time.

@@ -27,4 +27,13 @@ HEALTHCHECK_DOMAIN=""              # blank uses the first site in the registry
 HEALTHCHECK_PATH="/"               # lightweight path that reaches the backend
 HEALTHCHECK_EXPECTED_STATUS="200,301,302"
 
+# Optional separate healthchecks.io check for the weekly full upgrade
+# (period 7 days, grace ~1 day). Reports start, success, and failure.
+UPGRADE_HEALTHCHECKS_PING_URL=""
+
+# Strict-Transport-Security max-age in seconds; 0 disables HSTS. Browsers
+# remember it, so only lower it (or set 0 and wait out the old value) if a
+# proxied domain will ever need to be served over plain HTTP again.
+HSTS_MAX_AGE=31536000
+
 SWAP_SIZE_MB=2048

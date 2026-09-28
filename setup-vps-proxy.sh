@@ -8,7 +8,7 @@
 #   - Hostname, timezone, and a limited sudo user (general VPS-hardening
 #     server-hardening guide), with root's password locked once confirmed
 #     working alternative access exists
-#   - Tailscale (+ Tailscale SSH)   (official apt repo)
+#   - Tailscale (+ Tailscale SSH)   (vendor install script, which adds its apt repo)
 #   - ufw                           (official Ubuntu repo) — public: 80/443 only,
 #                                    SSH restricted to the tailscale0 interface only
 #   - nginx + libnginx-mod-http-geoip2 + geoipupdate + certbot (official Ubuntu repos)
@@ -16,7 +16,7 @@
 #     to every proxied site, plus optional streaming-specific tuning (disabled
 #     buffering, 1-hour timeouts) for any site tagged ":streaming" in the private sites registry
 #   - basic nginx hardening: server_tokens off, security headers, per-IP rate limiting
-#   - CrowdSec + firewall bouncer   (CrowdSec's official apt repo)
+#   - CrowdSec + firewall bouncer   (vendor install script, which adds its apt repo)
 #   - monit                         (official Ubuntu repo)
 #   - healthchecks.io heartbeat     (small local script + systemd timer)
 #
@@ -39,6 +39,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${EUID}" -ne 0 ]]; then
     echo "ERROR: run this script as root (for example: sudo ./setup-vps-proxy.sh)."
+    exit 1
+fi
+
+# Everything in this checkout runs as root, so anyone who can write to it
+# can become root. Refuse to run unless the checkout and every directory
+# above it are root-owned and not group/world-writable. (A modified copy of
+# this script could skip the check, so it guards against an unsafe setup
+# rather than an active attacker — the point is to never create one.)
+checkout_path_is_root_only() {
+    local path="$1" owner mode
+    read -r owner mode < <(stat -Lc '%u %a' "$path") || return 1
+    [[ "$owner" == "0" ]] && (( (8#$mode & 8#022) == 0 ))
+}
+UNSAFE_PATHS=()
+for checked_path in "${SCRIPT_DIR}/setup-vps-proxy.sh" "${SCRIPT_DIR}/lib/validation.sh" \
+                    "${SCRIPT_DIR}/lib"; do
+    checkout_path_is_root_only "$checked_path" || UNSAFE_PATHS+=("$checked_path")
+done
+checked_path="$SCRIPT_DIR"
+while :; do
+    checkout_path_is_root_only "$checked_path" || UNSAFE_PATHS+=("$checked_path")
+    [[ "$checked_path" == "/" ]] && break
+    checked_path="$(dirname "$checked_path")"
+done
+if (( ${#UNSAFE_PATHS[@]} > 0 )); then
+    echo "ERROR: these paths are not root-owned, or are writable by group/others:"
+    printf '    %s\n' "${UNSAFE_PATHS[@]}"
+    echo "Anyone who can write to them could run code as root through this script."
+    echo "Fix the checkout, then re-run:"
+    echo "    sudo chown -R root:root ${SCRIPT_DIR} && sudo chmod -R go-w ${SCRIPT_DIR}"
+    echo "(and update it afterwards with 'sudo git -C ${SCRIPT_DIR} pull')"
     exit 1
 fi
 
@@ -83,6 +114,7 @@ chmod 600 "$SITES_REGISTRY"
 validate_runtime_config
 validate_sites_file "$SITES_REGISTRY"
 SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
+HSTS_MAX_AGE="${HSTS_MAX_AGE:-31536000}"
 
 mapfile -t ALL_SITES < <(sites_records "$SITES_REGISTRY")
 declare -A SEEN=()
@@ -298,7 +330,7 @@ fi
 if command -v tailscale >/dev/null 2>&1; then
     echo "==> Tailscale already installed"
 else
-    run_step "Installing Tailscale (official apt repo)" bash -c 'curl -fsSL https://tailscale.com/install.sh | sh'
+    run_step "Installing Tailscale (vendor script adds its apt repo)" bash -c 'curl -fsSL https://tailscale.com/install.sh | sh'
 fi
 
 if tailscale status >/dev/null 2>&1; then
@@ -306,7 +338,17 @@ if tailscale status >/dev/null 2>&1; then
 else
     if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
         echo "==> Bringing up Tailscale with Tailscale SSH enabled"
-        tailscale up --ssh --authkey="${TAILSCALE_AUTHKEY:-}" --advertise-tags=tag:vps
+        # Hand the key over in a root-only file rather than on the command
+        # line, where any local user could read it from the process list.
+        authkey_file=$(mktemp)
+        chmod 600 "$authkey_file"
+        printf '%s' "$TAILSCALE_AUTHKEY" > "$authkey_file"
+        if ! tailscale up --ssh --auth-key="file:${authkey_file}" --advertise-tags=tag:vps; then
+            rm -f "$authkey_file"
+            echo "ERROR: 'tailscale up' failed; check the auth key and tag:vps ownership."
+            exit 1
+        fi
+        rm -f "$authkey_file"
         echo "    Enrolled successfully. TAILSCALE_AUTHKEY has done its job — it's not"
         echo "    needed again (future runs skip this step once already connected)."
         echo "    Consider blanking it out in vps-proxy.conf now rather than leaving"
@@ -412,6 +454,16 @@ log_format geoblock '\$remote_addr - [\$time_local] "\$request" \$status country
 access_log /var/log/nginx/geoblock.log geoblock;
 EOF
 
+# HSTS tells browsers to refuse plain HTTP for each proxied domain.
+# Deliberately no includeSubDomains/preload: other subdomains of the same
+# parent may not be served over HTTPS, and preload is very hard to undo.
+# Browsers ignore the header on plain-HTTP responses, so http-level is safe.
+if (( HSTS_MAX_AGE > 0 )); then
+    HSTS_HEADER_LINE="add_header Strict-Transport-Security \"max-age=${HSTS_MAX_AGE}\" always;"
+else
+    HSTS_HEADER_LINE="# HSTS disabled (HSTS_MAX_AGE=0)"
+fi
+
 # Ubuntu's nginx package sometimes already sets server_tokens directly in the
 # stock nginx.conf — declaring it again in our own conf.d file then causes a
 # hard duplicate-directive error. Check first rather than assume, same pattern
@@ -428,6 +480,7 @@ ${SERVER_TOKENS_LINE}
 add_header X-Content-Type-Options "nosniff" always;
 add_header X-Frame-Options "SAMEORIGIN" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+${HSTS_HEADER_LINE}
 
 # Correct websocket Connection-header handling per nginx's own documented
 # guidance (a hardcoded "Connection: upgrade" breaks non-websocket requests).
@@ -495,6 +548,8 @@ proxy_set_header X-Real-IP \$remote_addr;
 # where it could spoof the address Jellyfin logs and locks out.
 proxy_set_header X-Forwarded-For \$remote_addr;
 proxy_set_header X-Forwarded-Proto \$scheme;
+# HSTS is set once by this proxy; drop a backend's copy to avoid duplicates.
+proxy_hide_header Strict-Transport-Security;
 EOF
 }
 
@@ -511,6 +566,19 @@ proxy_read_timeout 3600s;
 proxy_send_timeout 3600s;
 EOF
 }
+
+# HTTP/2 syntax changed in nginx 1.25.1: the 'http2' listen parameter became
+# deprecated (with a warning on every reload) in favour of 'http2 on;'.
+# Ubuntu 22.04 ships 1.18 and 24.04 ships 1.24, so pick by version.
+NGINX_VERSION=$(nginx -v 2>&1 | sed -n 's#^nginx version: nginx/\([0-9.]*\).*#\1#p')
+if [[ -n "$NGINX_VERSION" ]] && dpkg --compare-versions "$NGINX_VERSION" ge 1.25.1; then
+    HTTP2_LISTEN_PARAM=""
+    HTTP2_DIRECTIVE="http2 on;"
+else
+    HTTP2_LISTEN_PARAM=" http2"
+    HTTP2_DIRECTIVE=""
+fi
+
 mkdir -p /etc/nginx/snippets
 write_shared_proxy_snippet
 write_streaming_proxy_snippet
@@ -571,8 +639,9 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen 443 ssl${HTTP2_LISTEN_PARAM};
+    listen [::]:443 ssl${HTTP2_LISTEN_PARAM};
+    ${HTTP2_DIRECTIVE}
     server_name ${domain};
 
     ssl_certificate ${certdir}/fullchain.pem;
@@ -794,7 +863,7 @@ systemctl enable --now certbot.timer
 if command -v cscli >/dev/null 2>&1; then
     echo "==> CrowdSec already installed"
 else
-    run_step "Installing CrowdSec (official apt repo)" bash -c 'curl -fsSL https://install.crowdsec.net | sh'
+    run_step "Adding CrowdSec's apt repo (vendor script)" bash -c 'curl -fsSL https://install.crowdsec.net | sh'
     run_step "Installing crowdsec package" apt-get "${APT_CONF_OPTS[@]}" install -y crowdsec
 fi
 run_step "Installing CrowdSec firewall bouncer" apt-get "${APT_CONF_OPTS[@]}" install -y crowdsec-firewall-bouncer-iptables
@@ -832,22 +901,57 @@ systemctl restart crowdsec crowdsec-firewall-bouncer
 # silently overwritten — this only affects package-shipped conffiles, not our
 # own files in conf.d/sites-available/snippets, which packages don't own and
 # can't touch regardless.
+#
+# DPkg::Lock::Timeout waits out apt's own daily jobs and unattended-upgrades
+# instead of failing on a held lock. --with-new-pkgs lets an upgrade that
+# gained a new dependency install it rather than being silently held back
+# (it still never removes packages). If UPGRADE_HEALTHCHECKS_PING_URL is set,
+# every run reports start/success/failure to its own healthchecks.io check,
+# so a failed upgrade alerts instead of sitting unnoticed in the journal.
 echo "==> Setting up weekly full upgrade (all repos) + CrowdSec hub refresh"
+install -d -m 700 -o root -g root /etc/vps-proxy
+if [[ -n "${UPGRADE_HEALTHCHECKS_PING_URL:-}" ]]; then
+    printf 'UPGRADE_PING_URL=%q\n' "$UPGRADE_HEALTHCHECKS_PING_URL" > /etc/vps-proxy/upgrade-ping.conf
+    chmod 600 /etc/vps-proxy/upgrade-ping.conf
+else
+    rm -f /etc/vps-proxy/upgrade-ping.conf
+fi
+
 cat > /usr/local/bin/weekly-full-upgrade.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get -y \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold" \
-    upgrade
-apt-get autoremove -y
+
+UPGRADE_PING_URL=""
+if [[ -r /etc/vps-proxy/upgrade-ping.conf ]]; then
+    # shellcheck source=/dev/null
+    source /etc/vps-proxy/upgrade-ping.conf
+fi
+ping_hc() {
+    [[ -n "$UPGRADE_PING_URL" ]] || return 0
+    curl -fsS -m 10 --retry 3 "${UPGRADE_PING_URL}$1" >/dev/null 2>&1 || true
+}
+report_exit() {
+    local status=$?
+    if (( status == 0 )); then ping_hc ""; else ping_hc "/fail"; fi
+}
+trap report_exit EXIT
+ping_hc "/start"
+
+APT_OPTS=(-o DPkg::Lock::Timeout=900
+          -o Dpkg::Options::=--force-confdef
+          -o Dpkg::Options::=--force-confold)
+apt-get "${APT_OPTS[@]}" update -y
+apt-get "${APT_OPTS[@]}" -y --with-new-pkgs upgrade
+apt-get "${APT_OPTS[@]}" autoremove -y
 if command -v cscli >/dev/null 2>&1; then
+    # New parsers/scenarios only take effect once CrowdSec reloads them.
+    cscli hub update || true
     cscli hub upgrade || true
+    systemctl reload crowdsec || true
 fi
 EOF
-chmod +x /usr/local/bin/weekly-full-upgrade.sh
+chmod 700 /usr/local/bin/weekly-full-upgrade.sh
 
 cat > /etc/systemd/system/weekly-full-upgrade.service <<'EOF'
 [Unit]
@@ -892,13 +996,18 @@ ufw allow 443/tcp comment 'vps-proxy HTTPS'
 ufw allow in on tailscale0 to any port 22 proto tcp comment 'vps-proxy Tailscale SSH'
 ufw allow 41641/udp comment 'vps-proxy Tailscale direct'
 
-# Never silently remove administrator rules. Abort if a conventional public
-# SSH rule is present and print exact manual remediation instead.
-if ufw show added | grep -Eq '^ufw (allow|limit)( in)? (22(/tcp)?|OpenSSH)([[:space:]]|$)' ||
-   ufw status | grep -Eq '^(22(/tcp)?|OpenSSH)[[:space:]]+(ALLOW|LIMIT)[[:space:]]+IN[[:space:]]+Anywhere'; then
-    echo "ERROR: UFW contains a public SSH rule. This script will not remove it automatically."
-    echo "Review 'ufw status numbered', delete only the public port-22/OpenSSH rule,"
-    echo "confirm Tailscale SSH works, then re-run."
+# Never silently remove administrator rules. Abort if any rule opens SSH to
+# every source address and print exact manual remediation instead. 'ufw show
+# added' lists every user rule whether or not UFW is active yet.
+PUBLIC_SSH_RULES=()
+while IFS= read -r ufw_rule; do
+    ufw_rule_is_public_ssh "$ufw_rule" && PUBLIC_SSH_RULES+=("$ufw_rule")
+done < <(ufw show added)
+if (( ${#PUBLIC_SSH_RULES[@]} > 0 )); then
+    echo "ERROR: UFW contains a public SSH rule. This script will not remove it automatically:"
+    printf '    %s\n' "${PUBLIC_SSH_RULES[@]}"
+    echo "Confirm Tailscale SSH works, remove each rule above (replace 'ufw allow' with"
+    echo "'ufw delete allow', or use 'ufw status numbered' + 'ufw delete N'), then re-run."
     exit 1
 fi
 
@@ -1081,13 +1190,13 @@ else
     echo "==> SKIPPED healthchecks.io wiring — set HEALTHCHECKS_PING_URL to enable it."
 fi
 
-echo "==> Manual git workflow: on this VPS, run 'git -C ${SCRIPT_DIR} pull' then"
+echo "==> Manual git workflow: on this VPS, run 'sudo git -C ${SCRIPT_DIR} pull' then"
 echo "    re-run this script whenever you've pushed changes."
 
 echo ""
 echo "=========================================================================="
 echo " Setup complete. Currently proxied sites:"
-sed 's/^/   - /' "$SITES_REGISTRY" 2>/dev/null
+printf '   - %s\n' "${ALL_SITES[@]}"
 echo ""
 echo " To add or remove a service later: edit ${SITES_REGISTRY} on the VPS and re-run."
 echo ""

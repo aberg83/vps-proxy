@@ -35,7 +35,7 @@ validate_sites_file() {
         line="${line%$'\r'}"
         [[ "$line" =~ ^[[:space:]]*$ || "$line" =~ ^[[:space:]]*# ]] && continue
 
-        if [[ ! "$line" =~ ^([^:[:space:]]+):([0-9]+)(:(standard|streaming))?[[:space:]]*$ ]]; then
+        if [[ ! "$line" =~ ^([^:[:space:]]+):([0-9]{1,5})(:(standard|streaming))?[[:space:]]*$ ]]; then
             validation_error "$registry:$line_number: expected domain:port[:standard|streaming]"
             return 1
         fi
@@ -56,6 +56,41 @@ validate_sites_file() {
 
     (( ${#domains[@]} > 0 )) ||
         { validation_error "$registry must contain at least one site"; return 1; }
+}
+
+# Succeeds when one `ufw show added` line opens SSH to any source address.
+# Rules scoped to tailscale0 or to specific source addresses are not public.
+ufw_rule_is_public_ssh() {
+    local rule="$1" source ports port
+    local -a port_list
+
+    rule="${rule%% comment *}"
+    [[ "$rule" =~ ^ufw\ (allow|limit)\  ]] || return 1
+    [[ "$rule" =~ \ on\ tailscale0( |$) ]] && return 1
+
+    if [[ "$rule" =~ \ from\ ([^ ]+) ]]; then
+        source="${BASH_REMATCH[1]}"
+        [[ "$source" == "any" || "$source" == "0.0.0.0/0" || "$source" == "::/0" ]] || return 1
+    fi
+
+    # Simple syntax: ufw allow [in] 22[/tcp] | OpenSSH | ssh
+    [[ "$rule" =~ ^ufw\ (allow|limit)(\ in)?\ (22|22/tcp|OpenSSH|ssh)$ ]] && return 0
+
+    # Full syntax: ... to <addr> app OpenSSH | to <addr> port <list> [proto tcp]
+    [[ "$rule" =~ \ to\ [^\ ]+\ app\ (OpenSSH|ssh)( |$) ]] && return 0
+    [[ "$rule" =~ \ proto\ udp( |$) ]] && return 1
+    if [[ "$rule" =~ \ to\ [^\ ]+\ port\ ([0-9,:]+) ]]; then
+        ports="${BASH_REMATCH[1]}"
+        IFS=',' read -r -a port_list <<< "$ports"
+        for port in "${port_list[@]}"; do
+            if [[ "$port" == *:* ]]; then
+                (( 10#${port%%:*} <= 22 && 22 <= 10#${port##*:} )) && return 0
+            else
+                (( 10#$port == 22 )) && return 0
+            fi
+        done
+    fi
+    return 1
 }
 
 validate_runtime_config() {
@@ -79,6 +114,9 @@ validate_runtime_config() {
 
     [[ "${SWAP_SIZE_MB:-2048}" =~ ^[1-9][0-9]*$ ]] ||
         { validation_error "SWAP_SIZE_MB must be a positive integer"; return 1; }
+
+    [[ "${HSTS_MAX_AGE:-31536000}" =~ ^(0|[1-9][0-9]{0,8})$ ]] ||
+        { validation_error "HSTS_MAX_AGE must be a whole number of seconds (0 disables HSTS)"; return 1; }
 
     [[ "${LOCK_ROOT_PASSWORD:-false}" == "true" || "${LOCK_ROOT_PASSWORD:-false}" == "false" ]] ||
         { validation_error "LOCK_ROOT_PASSWORD must be true or false"; return 1; }
@@ -104,6 +142,14 @@ validate_runtime_config() {
         [[ -n "${MAXMIND_ACCOUNT_ID:-}" && -n "${MAXMIND_LICENSE_KEY:-}" ]] ||
             { validation_error "set both MaxMind values or neither"; return 1; }
     fi
+
+    local url_var
+    for url_var in HEALTHCHECKS_PING_URL UPGRADE_HEALTHCHECKS_PING_URL; do
+        if [[ -n "${!url_var:-}" && ! "${!url_var}" =~ ^https?://[^[:space:]]+$ ]]; then
+            validation_error "$url_var must be an http(s):// URL with no whitespace"
+            return 1
+        fi
+    done
 
     if [[ -n "${HEALTHCHECK_DOMAIN:-}" ]] && ! validate_hostname "$HEALTHCHECK_DOMAIN"; then
         validation_error "HEALTHCHECK_DOMAIN is not a valid lowercase DNS hostname"
