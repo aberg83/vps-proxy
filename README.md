@@ -13,6 +13,8 @@ limited to HTTP/HTTPS; backend traffic crosses Tailscale.
 - Generated nginx changes are rolled back if validation or certificate issuance fails.
 - Only sites recorded in the project's managed-state file can be pruned.
 - Existing unrelated nginx configurations and UFW rules are not silently deleted.
+- A catch-all default server closes connections for unknown hostnames and bare-IP
+  scans, presenting a self-signed certificate instead of a real site's.
 
 ## Files
 
@@ -50,8 +52,8 @@ them on the VPS; do not commit deployment inventory or credentials.
    sudoedit /etc/vps-proxy/sites.list
    ```
 
-4. Fill in MaxMind credentials for the first run. They may be removed after
-   `GeoLite2-Country.mmdb` has been downloaded.
+4. Fill in MaxMind credentials for the first run. They are stored in
+   root-only `/etc/GeoIP.conf` so the database keeps updating automatically.
 5. Run:
 
    ```bash

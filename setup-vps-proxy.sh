@@ -82,6 +82,7 @@ chmod 600 "$SITES_REGISTRY"
 
 validate_runtime_config
 validate_sites_file "$SITES_REGISTRY"
+SWAP_SIZE_MB="${SWAP_SIZE_MB:-2048}"
 
 mapfile -t ALL_SITES < <(sites_records "$SITES_REGISTRY")
 declare -A SEEN=()
@@ -160,17 +161,24 @@ run_step() {
     return $status
 }
 
+# run_step backgrounds each command with no terminal input, so any debconf or
+# dpkg conffile prompt (common on provider images with a modified
+# sshd_config) would fail instead of asking. Answer them deterministically:
+# keep the locally modified config file, same policy as the weekly upgrade.
+export DEBIAN_FRONTEND=noninteractive
+APT_CONF_OPTS=(-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+
 echo "==> Enabling universe repo"
 add-apt-repository -y universe
 
 run_step "Updating package lists" apt-get update -y
-run_step "Upgrading installed packages" apt-get upgrade -y
-run_step "Installing base packages" apt-get install -y curl gnupg2 ca-certificates lsb-release apt-transport-https git
+run_step "Upgrading installed packages" apt-get "${APT_CONF_OPTS[@]}" upgrade -y
+run_step "Installing base packages" apt-get "${APT_CONF_OPTS[@]}" install -y curl gnupg2 ca-certificates lsb-release apt-transport-https git
 
 ### ---------------------------------------------------------------------------
 ### 0a. Unattended security upgrades
 ### ---------------------------------------------------------------------------
-run_step "Installing unattended-upgrades (auto-applies security patches)" apt-get install -y unattended-upgrades apt-listchanges
+run_step "Installing unattended-upgrades (auto-applies security patches)" apt-get "${APT_CONF_OPTS[@]}" install -y unattended-upgrades apt-listchanges
 echo 'APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";' > /etc/apt/apt.conf.d/20auto-upgrades
 # Auto-reboot is deliberately left OFF — this box runs family-facing services;
@@ -313,7 +321,7 @@ fi
 ### ---------------------------------------------------------------------------
 ### 2. nginx + GeoIP2 module + certbot + hardening
 ### ---------------------------------------------------------------------------
-run_step "Installing nginx, GeoIP2 module, geoipupdate, certbot" apt-get install -y nginx libnginx-mod-http-geoip2 geoipupdate certbot
+run_step "Installing nginx, GeoIP2 module, geoipupdate, certbot" apt-get "${APT_CONF_OPTS[@]}" install -y nginx libnginx-mod-http-geoip2 geoipupdate certbot
 
 echo "==> Configuring geoipupdate"
 mkdir -p /usr/share/GeoIP
@@ -328,7 +336,13 @@ EOF
     run_step "Downloading GeoIP database" geoipupdate -v
     systemctl enable --now geoipupdate.timer
 else
-    echo "    Reusing the existing GeoLite2 database; credentials are not stored."
+    if [[ -s /etc/GeoIP.conf ]]; then
+        echo "    MaxMind values blank in vps-proxy.conf; keeping the existing /etc/GeoIP.conf"
+        echo "    (root-only) so geoipupdate.timer can keep the database current."
+    else
+        echo "    WARNING: no /etc/GeoIP.conf — the existing GeoLite2 database will not be"
+        echo "    updated. Set the MaxMind values in vps-proxy.conf and re-run."
+    fi
 fi
 
 echo "==> Enabling the GeoIP2 nginx module"
@@ -476,7 +490,10 @@ proxy_set_header Upgrade \$http_upgrade;
 proxy_set_header Connection \$connection_upgrade;
 proxy_set_header Host \$host;
 proxy_set_header X-Real-IP \$remote_addr;
-proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+# This VPS is the first hop from the internet, so overwrite rather than
+# append: a client-supplied X-Forwarded-For must never reach the backend,
+# where it could spoof the address Jellyfin logs and locks out.
+proxy_set_header X-Forwarded-For \$remote_addr;
 proxy_set_header X-Forwarded-Proto \$scheme;
 EOF
 }
@@ -568,12 +585,14 @@ server {
         root /var/www/certbot;
     }
 
-    # Jellyfin's own login API. Exact-match so this only applies to that one
-    # literal path — harmless no-op on any site that doesn't have it (Seerr,
-    # anything future). A much stricter rate limit here than the general one,
-    # specifically to slow automated credential guessing against short PINs.
-    # This is friction, not a substitute for Jellyfin's own account lockout.
-    location = /Users/AuthenticateByName {
+    # Jellyfin's own login API — harmless no-op on any site that doesn't have
+    # these paths (Seerr, anything future). A much stricter rate limit here
+    # than the general one, specifically to slow automated credential guessing
+    # against short PINs. This is friction, not a substitute for Jellyfin's
+    # own account lockout. Case-insensitive regex because Jellyfin's routing
+    # is case-insensitive and still accepts the legacy /emby/ prefix; an
+    # exact-match location would let /users/authenticatebyname skip it.
+    location ~* ^(/emby)?/Users/(AuthenticateByName|AuthenticateWithQuickConnect)/?\$ {
         if (\$request_allowed = no) {
             return 403;
         }
@@ -638,12 +657,18 @@ provision_site() {
     }
 
     echo "==> Provisioning ${domain} -> ${BACKEND_TAILNET_HOST}:${port} (tuning: ${tuning})"
-    write_bootstrap_site "$domain"
-    if ! nginx -t; then
-        rollback_site
-        return 1
+    # Only a site without both a certificate and an existing config needs the
+    # HTTP-only bootstrap config. Swapping it in for an already-certified site
+    # would drop that site's HTTPS server for the whole certbot run, and the
+    # existing final config already serves the ACME challenge path.
+    if [[ ! -f "/etc/letsencrypt/live/${domain}/fullchain.pem" || "$had_previous" == "false" ]]; then
+        write_bootstrap_site "$domain"
+        if ! nginx -t; then
+            rollback_site
+            return 1
+        fi
+        nginx_apply
     fi
-    nginx_apply
 
     if ! run_step "Requesting certificate for ${domain}" certbot certonly --webroot -w /var/www/certbot \
         -d "$domain" \
@@ -662,6 +687,45 @@ provision_site() {
 }
 
 rm -f /etc/nginx/sites-enabled/default
+
+# Catch-all for requests naming no configured site (bare-IP scans, forged Host
+# headers). Without it nginx hands them to the first site alphabetically:
+# proxied to that backend, and its real certificate — which names the domain
+# — shown to every scanner. The self-signed snakeoil certificate reveals
+# nothing and still completes the handshake that monit's tcpssl check needs
+# (ssl_reject_handshake would break that check and needs nginx >= 1.19.4,
+# which Ubuntu 22.04 doesn't ship). 444 closes the connection without a reply.
+DEFAULT_SITE_CONF="/etc/nginx/sites-available/000-vps-proxy-default.conf"
+if grep -RqsE '^[^#]*listen[^;]*default_server' /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ \
+       --exclude=000-vps-proxy-default.conf; then
+    echo "==> Another nginx default_server exists — not adding the catch-all server"
+else
+    echo "==> Writing catch-all default server"
+    run_step "Installing ssl-cert (self-signed default certificate)" apt-get "${APT_CONF_OPTS[@]}" install -y ssl-cert
+    [[ -s /etc/ssl/private/ssl-cert-snakeoil.key ]] || make-ssl-cert generate-default-snakeoil
+    cat > "$DEFAULT_SITE_CONF" <<'EOF'
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_name _;
+
+    ssl_certificate /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+
+    return 444;
+}
+EOF
+    ln -sf "$DEFAULT_SITE_CONF" /etc/nginx/sites-enabled/000-vps-proxy-default.conf
+    if nginx -t; then
+        nginx_apply
+    else
+        echo "ERROR: catch-all default server failed nginx -t; removing it."
+        rm -f "$DEFAULT_SITE_CONF" /etc/nginx/sites-enabled/000-vps-proxy-default.conf
+        exit 1
+    fi
+fi
 
 echo "==> (Re-)provisioning all known sites"
 PROVISION_FAILED=false
@@ -731,9 +795,9 @@ if command -v cscli >/dev/null 2>&1; then
     echo "==> CrowdSec already installed"
 else
     run_step "Installing CrowdSec (official apt repo)" bash -c 'curl -fsSL https://install.crowdsec.net | sh'
-    run_step "Installing crowdsec package" apt-get install -y crowdsec
+    run_step "Installing crowdsec package" apt-get "${APT_CONF_OPTS[@]}" install -y crowdsec
 fi
-run_step "Installing CrowdSec firewall bouncer" apt-get install -y crowdsec-firewall-bouncer-iptables
+run_step "Installing CrowdSec firewall bouncer" apt-get "${APT_CONF_OPTS[@]}" install -y crowdsec-firewall-bouncer-iptables
 
 cat > /etc/crowdsec/acquis.d/nginx.yaml <<EOF
 filenames:
@@ -813,7 +877,7 @@ systemctl enable --now weekly-full-upgrade.timer
 ### ---------------------------------------------------------------------------
 ### 4. ufw — public 80/443 only, SSH restricted to the Tailscale interface
 ### ---------------------------------------------------------------------------
-run_step "Installing ufw" apt-get install -y ufw
+run_step "Installing ufw" apt-get "${APT_CONF_OPTS[@]}" install -y ufw
 
 UFW_WAS_ACTIVE=false
 ufw status | grep -q "Status: active" && UFW_WAS_ACTIVE=true
@@ -890,7 +954,7 @@ ufw status verbose
 ### ---------------------------------------------------------------------------
 ### 5. monit
 ### ---------------------------------------------------------------------------
-run_step "Installing monit" apt-get install -y monit
+run_step "Installing monit" apt-get "${APT_CONF_OPTS[@]}" install -y monit
 
 # Enable monit's control interface, localhost-only. Without this, even local
 # CLI commands like `monit status` can't reach the running daemon at all —
@@ -1031,8 +1095,7 @@ echo " Remaining manual steps:"
 echo "  1. If Tailscale wasn't brought up yet: tailscale up --ssh --advertise-tags=tag:vps"
 echo "  2. In the Tailscale admin console, scope tag:vps's ACL to only the ports"
 echo "     listed above on ${BACKEND_TAILNET_HOST}."
-echo "  3. If MaxMind credentials weren't set, edit /etc/GeoIP.conf, then run:"
-echo "       geoipupdate -v && systemctl enable --now geoipupdate.timer"
+echo "  3. Confirm GeoIP updates are scheduled: systemctl list-timers geoipupdate.timer"
 echo "  4. Point DNS at this VPS for any site where certbot failed, then re-run."
 echo "  5. Confirm ufw: ufw status verbose"
 echo "  6. Confirm root's password is locked (if LOCK_ROOT_PASSWORD=true): passwd -S root"
