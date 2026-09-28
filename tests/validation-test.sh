@@ -29,6 +29,7 @@ expect_invalid 'media.example.com:65536'
 expect_invalid 'media.example.com:443:unknown'
 expect_invalid $'media.example.com:443\nmedia.example.com:8443'
 expect_invalid '../escape:443'
+expect_invalid 'media.example.com:18446744073709552059'
 expect_invalid ''
 
 validate_host_label 'vps-proxy'
@@ -50,7 +51,8 @@ runtime_config() {
         CERTBOT_EMAIL="admin@example.com"
         unset SWAP_SIZE_MB LOCK_ROOT_PASSWORD NEW_SUDO_USERNAME VPS_HOSTNAME \
             MAXMIND_ACCOUNT_ID MAXMIND_LICENSE_KEY HEALTHCHECK_DOMAIN \
-            HEALTHCHECK_PATH HEALTHCHECK_EXPECTED_STATUS
+            HEALTHCHECK_PATH HEALTHCHECK_EXPECTED_STATUS HSTS_MAX_AGE \
+            HEALTHCHECKS_PING_URL UPGRADE_HEALTHCHECKS_PING_URL
         for assignment in "$@"; do
             if [[ "$assignment" == unset:* ]]; then
                 unset "${assignment#unset:}"
@@ -83,6 +85,9 @@ expect_config_valid 'VPS_HOSTNAME=vps-proxy' 'VPS_HOSTNAME=vps.example.com'
 expect_config_valid 'MAXMIND_ACCOUNT_ID=123' 'MAXMIND_LICENSE_KEY=abc'
 expect_config_valid 'HEALTHCHECK_DOMAIN=media.example.com' 'HEALTHCHECK_PATH=/health' \
     'HEALTHCHECK_EXPECTED_STATUS=200,204'
+expect_config_valid 'HSTS_MAX_AGE=0' 'HSTS_MAX_AGE=63072000'
+expect_config_valid 'HEALTHCHECKS_PING_URL=https://hc-ping.com/abc' \
+    'UPGRADE_HEALTHCHECKS_PING_URL=http://hc.example.ts.net/ping/abc'
 expect_config_invalid 'unset:BACKEND_TAILNET_HOST'
 expect_config_invalid 'unset:ALLOWED_COUNTRY'
 expect_config_invalid 'unset:CERTBOT_EMAIL'
@@ -103,6 +108,34 @@ expect_config_invalid 'HEALTHCHECK_PATH=health'
 expect_config_invalid 'HEALTHCHECK_PATH=/a b'
 expect_config_invalid 'HEALTHCHECK_EXPECTED_STATUS=200;301'
 expect_config_invalid 'HEALTHCHECK_EXPECTED_STATUS=600'
+expect_config_invalid 'HSTS_MAX_AGE=-1'
+expect_config_invalid 'HSTS_MAX_AGE=1y'
+expect_config_invalid 'HSTS_MAX_AGE=0100'
+expect_config_invalid 'HEALTHCHECKS_PING_URL=hc-ping.com/abc'
+expect_config_invalid 'UPGRADE_HEALTHCHECKS_PING_URL=https://hc-ping.com/a b'
+
+# Rules as printed by 'ufw show added'.
+for rule in 'ufw allow 22' 'ufw allow 22/tcp' 'ufw allow in 22/tcp' 'ufw limit 22/tcp' \
+            'ufw allow OpenSSH' 'ufw allow ssh' "ufw allow 22/tcp comment 'old rule'" \
+            'ufw allow to any port 22' 'ufw allow proto tcp from any to any port 22' \
+            'ufw allow from 0.0.0.0/0 to any port 22' 'ufw allow from any to any port 80,22' \
+            'ufw allow from any to any port 20:25 proto tcp' \
+            'ufw allow from any to any app OpenSSH' 'ufw allow in on eth0 to any port 22'; do
+    if ! ufw_rule_is_public_ssh "$rule"; then
+        echo "public SSH rule not detected: $rule" >&2
+        exit 1
+    fi
+done
+for rule in "ufw allow in on tailscale0 to any port 22 proto tcp comment 'vps-proxy Tailscale SSH'" \
+            'ufw allow from 203.0.113.4 to any port 22' 'ufw allow 80/tcp' 'ufw allow 222/tcp' \
+            'ufw allow to any port 2222' 'ufw allow proto udp to any port 22' 'ufw deny 22/tcp' \
+            "ufw allow 41641/udp comment 'vps-proxy Tailscale direct'" \
+            "Added user rules (see 'ufw status' for running firewall):"; do
+    if ufw_rule_is_public_ssh "$rule"; then
+        echo "non-public rule flagged as public SSH: $rule" >&2
+        exit 1
+    fi
+done
 
 setup_script="${REPO_ROOT}/setup-vps-proxy.sh"
 # shellcheck disable=SC2016
