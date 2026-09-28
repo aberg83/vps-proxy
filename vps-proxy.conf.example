@@ -8,8 +8,10 @@ LOCK_ROOT_PASSWORD=false           # true requires NEW_SUDO_USERNAME
 
 BACKEND_TAILNET_HOST="backend.your-tailnet.ts.net"
 
-# Required on the first run. After GeoLite2-Country.mmdb exists, these may be
-# blanked to avoid retaining the MaxMind credential on the VPS.
+# Required on the first run. They are written to root-only /etc/GeoIP.conf,
+# which geoipupdate.timer needs to keep the database current (the GeoLite2
+# licence expects regular updates). Blanking them here later leaves that file
+# in place; it does not remove the credential from the VPS.
 MAXMIND_ACCOUNT_ID=""
 MAXMIND_LICENSE_KEY=""
 
